@@ -1,0 +1,66 @@
+name: Convert GIFs to MP4
+
+on:
+  push:
+    paths:
+      - 'social-media-temp/*.gif'
+
+# One conversion run at a time, so commits never collide.
+concurrency:
+  group: gif-to-mp4
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Make sure ffmpeg is available
+        run: |
+          command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+
+      - name: Convert each new GIF to an Instagram-ready MP4
+        run: |
+          shopt -s nullglob
+          dir="social-media-temp"
+          for f in "$dir"/*.gif; do
+            out="${f%.gif}.mp4"
+            if [ -f "$out" ] || [ -f "$out.error" ]; then continue; fi
+            echo "Converting $f"
+            dur=$(timeout 30 ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null || true)
+            # A real GIF always has a duration. Anything else is not a readable GIF.
+            if ! awk -v d="$dur" 'BEGIN { exit !(d + 0 > 0) }'; then
+              echo "This file is not a readable GIF." > "$out.error"
+              continue
+            fi
+            # Instagram needs at least 3 seconds. Loop short GIFs a whole number of times.
+            length=$(awk -v d="$dur" 'BEGIN { if (d >= 3) { print d } else { n = int(3 / d); if (n * d < 3) n++; printf "%.3f", n * d } }')
+            if timeout 120 ffmpeg -y -v error -stream_loop -1 -i "$f" -t "$length" \
+                -vf "scale='trunc(min(1,1080/max(iw,ih))*iw/2)*2':'trunc(min(1,1080/max(iw,ih))*ih/2)*2',format=yuv420p" \
+                -r 30 -c:v libx264 -profile:v high -crf 23 -preset medium -an -movflags +faststart "$out" 2> "$out.log"; then
+              rm -f "$out.log"
+            else
+              mv "$out.log" "$out.error"
+              rm -f "$out"
+            fi
+          done
+
+      - name: Save the videos
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add social-media-temp
+          if git diff --cached --quiet; then
+            echo "Nothing to save"
+          else
+            git commit -m "Convert GIFs to MP4"
+            for attempt in 1 2 3; do
+              git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && break
+              sleep 3
+            done
+          fi
